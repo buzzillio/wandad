@@ -4,11 +4,13 @@ import numpy as np
 import random
 import torch
 from datasets import load_dataset
+from huggingface_hub import hf_hub_download
 
 # Set seed for reproducibility
 def set_seed(seed):
     np.random.seed(seed)
     torch.random.manual_seed(seed)
+    random.seed(seed)
 
 # Wrapper for tokenized input IDs
 class TokenizerWrapper:
@@ -44,26 +46,21 @@ def get_wikitext2(nsamples, seed, seqlen, tokenizer):
 #     valdata = load_dataset('allenai/c4', 'allenai--c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation')
 
 
+def _download_c4_shard(filename):
+    return hf_hub_download(
+        repo_id="allenai/c4",
+        filename=f"en/{filename}",
+        repo_type="dataset",
+    )
+
+
 def get_c4(nsamples, seed, seqlen, tokenizer):
     set_seed(seed)
-    data_files = {
-        "train": "en/c4-train.00000-of-01024.json.gz",
-        "validation": "en/c4-validation.00000-of-00008.json.gz",
-    }
+    train_path = _download_c4_shard("c4-train.00000-of-01024.json.gz")
+    val_path = _download_c4_shard("c4-validation.00000-of-00008.json.gz")
 
-    # Loading a subset of the official C4 shards triggers HuggingFace's split
-    # verification logic unless we explicitly disable it. Since we only need a
-    # tiny calibration subset, skip the global size checks to avoid
-    # NonMatchingSplitsSizesError while still downloading the exact shards we
-    # request.
-    ds = load_dataset(
-        "allenai/c4",
-        "en",
-        data_files=data_files,
-        verification_mode="no_checks",
-    )
-    traindata = ds["train"]
-    valdata = ds["validation"]
+    traindata = load_dataset("json", data_files={"train": train_path}, split="train")
+    valdata = load_dataset("json", data_files={"train": val_path}, split="train")
 
     # Generate samples from training set
     trainloader = []
