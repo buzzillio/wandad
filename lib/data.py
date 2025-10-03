@@ -2,11 +2,29 @@
 
 import gzip
 import json
+import os
+from pathlib import Path
 import numpy as np
 import random
 import torch
 from datasets import load_dataset
 from huggingface_hub import hf_hub_download
+from urllib.request import urlretrieve
+import zipfile
+
+
+'''
+
+python main.py \
+  --model baffo32/decapoda-research-llama-7B-hf \
+  --prune_method wanda \
+  --sparsity_ratio 0.5 \
+  --sparsity_type unstructured \
+  --save out/llama_7b/unstructured/wanda/
+
+
+'''
+
 
 # Set seed for reproducibility
 def set_seed(seed):
@@ -19,15 +37,59 @@ class TokenizerWrapper:
     def __init__(self, input_ids):
         self.input_ids = input_ids
 
+def _ensure_wikitext_s3_file(filename):
+    cache_dir = Path(os.getenv("HF_HOME", os.path.expanduser("~/.cache"))) / "wandad" / "wikitext-2-raw"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    target_file = cache_dir / filename
+    if target_file.exists():
+        return str(target_file)
+
+    zip_path = cache_dir / "wikitext-2-raw-v1.zip"
+    if not zip_path.exists():
+        url = "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-2-raw-v1.zip"
+        print(f"[info] Downloading wikitext-2-raw-v1 from {url}")
+        urlretrieve(url, zip_path)
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        inner_path = f"wikitext-2-raw/wiki.{filename.split('.',1)[1]}"
+        with zf.open(inner_path) as source, open(target_file, "wb") as dest:
+            dest.write(source.read())
+    return str(target_file)
+
+
+def _load_wikitext_split(filename):
+    try:
+        path = hf_hub_download(
+            repo_id="wikitext",
+            filename=f"wikitext-2-raw-v1/{filename}",
+            repo_type="dataset",
+        )
+    except Exception:
+        path = _ensure_wikitext_s3_file(filename)
+
+    with open(path, "r", encoding="utf-8") as f:
+        # Mirror the original dataset: each line represents one sample, keep blanks
+        lines = [line.rstrip("\n") for line in f]
+    return lines
+
+
 # Load and process wikitext2 dataset
 def get_wikitext2(nsamples, seed, seqlen, tokenizer):
-    # Load train and test datasets
-    traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-    testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+    try:
+        traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
+        testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
+        train_text = traindata['text']
+        test_text = testdata['text']
+    except Exception as err:
+        if "Invalid pattern" not in str(err):
+            raise
+        print("[info] Falling back to manual wikitext-2 download via huggingface_hub")
+        train_text = _load_wikitext_split("wiki.train.raw")
+        test_text = _load_wikitext_split("wiki.test.raw")
 
     # Encode datasets
-    trainenc = tokenizer(" ".join(traindata['text']), return_tensors='pt')
-    testenc = tokenizer("\n\n".join(testdata['text']), return_tensors='pt')
+    trainenc = tokenizer(" ".join(train_text), return_tensors='pt')
+    testenc = tokenizer("\n\n".join(test_text), return_tensors='pt')
 
     # Generate samples from training set
     random.seed(seed)
