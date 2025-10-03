@@ -1,5 +1,7 @@
 # Code adapted from https://github.com/IST-DASLab/sparsegpt/blob/master/datautils.py
 
+import gzip
+import json
 import numpy as np
 import random
 import torch
@@ -54,32 +56,67 @@ def _download_c4_shard(filename):
     )
 
 
+def _iter_c4_records(filepath):
+    with gzip.open(filepath, "rt", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            text = record.get("text", "")
+            if text:
+                yield text
+
+
 def get_c4(nsamples, seed, seqlen, tokenizer):
     set_seed(seed)
     train_path = _download_c4_shard("c4-train.00000-of-01024.json.gz")
     val_path = _download_c4_shard("c4-validation.00000-of-00008.json.gz")
 
-    traindata = load_dataset("json", data_files={"train": train_path}, split="train")
-    valdata = load_dataset("json", data_files={"train": val_path}, split="train")
+    candidate_tokens = []
+    max_candidates = max(nsamples * 20, 2000)
+    for text in _iter_c4_records(train_path):
+        enc = tokenizer(text, return_tensors="pt")
+        if enc.input_ids.shape[1] > seqlen:
+            candidate_tokens.append(enc.input_ids)
+        if len(candidate_tokens) >= max_candidates:
+            break
 
-    # Generate samples from training set
+    if not candidate_tokens:
+        raise RuntimeError("Unable to collect C4 calibration samples longer than seqlen")
+
     trainloader = []
-    for _ in range(nsamples):
-        while True:
-            i = random.randint(0, len(traindata) - 1)
-            text = traindata[i]["text"]
-            trainenc = tokenizer(text, return_tensors="pt")
-            if trainenc.input_ids.shape[1] > seqlen:
-                break
-        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
-        j = i + seqlen
-        inp = trainenc.input_ids[:, i:j]
+    attempts = 0
+    max_attempts = nsamples * 20
+    while len(trainloader) < nsamples and attempts < max_attempts:
+        attempts += 1
+        enc = random.choice(candidate_tokens)
+        length = enc.shape[1]
+        if length <= seqlen:
+            continue
+        start = random.randint(0, length - seqlen - 1)
+        end = start + seqlen
+        inp = enc[:, start:end]
         tar = inp.clone()
         tar[:, :-1] = -100
         trainloader.append((inp, tar))
 
-    # Prepare validation dataset
-    valenc = tokenizer(" ".join(valdata[:1100]["text"]), return_tensors="pt")
+    if len(trainloader) < nsamples:
+        raise RuntimeError(f"Could only generate {len(trainloader)} C4 calibration samples out of requested {nsamples}")
+
+    val_texts = []
+    for text in _iter_c4_records(val_path):
+        val_texts.append(text)
+        if len(val_texts) >= 1100:
+            break
+
+    if not val_texts:
+        raise RuntimeError("Validation split of C4 did not yield any text records")
+
+    valenc = tokenizer(" ".join(val_texts), return_tensors="pt")
     valenc = valenc.input_ids[:, :(256 * seqlen)]
     valenc = TokenizerWrapper(valenc)
     return trainloader, valenc
