@@ -45,24 +45,33 @@ def get_wikitext2(nsamples, seed, seqlen, tokenizer):
 
 
 def get_c4(nsamples, seed, seqlen, tokenizer):
+    set_seed(seed)
     data_files = {
         "train": "en/c4-train.00000-of-01024.json.gz",
         "validation": "en/c4-validation.00000-of-00008.json.gz",
     }
-    ds = load_dataset("allenai/c4", "en", data_files=data_files)  # one call that defines both splits
+
+    # Loading a subset of the official C4 shards triggers HuggingFace's split
+    # verification logic unless we explicitly disable it. Since we only need a
+    # tiny calibration subset, skip the global size checks to avoid
+    # NonMatchingSplitsSizesError while still downloading the exact shards we
+    # request.
+    ds = load_dataset(
+        "allenai/c4",
+        "en",
+        data_files=data_files,
+        verification_mode="no_checks",
+    )
     traindata = ds["train"]
     valdata = ds["validation"]
-    return traindata, valdata
-
-
 
     # Generate samples from training set
-    random.seed(seed)
     trainloader = []
     for _ in range(nsamples):
         while True:
             i = random.randint(0, len(traindata) - 1)
-            trainenc = tokenizer(traindata[i]['text'], return_tensors='pt')
+            text = traindata[i]["text"]
+            trainenc = tokenizer(text, return_tensors="pt")
             if trainenc.input_ids.shape[1] > seqlen:
                 break
         i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
@@ -73,7 +82,7 @@ def get_c4(nsamples, seed, seqlen, tokenizer):
         trainloader.append((inp, tar))
 
     # Prepare validation dataset
-    valenc = tokenizer(' '.join(valdata[:1100]['text']), return_tensors='pt')
+    valenc = tokenizer(" ".join(valdata[:1100]["text"]), return_tensors="pt")
     valenc = valenc.input_ids[:, :(256 * seqlen)]
     valenc = TokenizerWrapper(valenc)
     return trainloader, valenc
