@@ -221,10 +221,13 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
         if num_to_prune <= 0:
             return 0, numel
 
-        flat_metric = metric_tensor.view(-1)
-        # kthvalue expects 1-indexed k; clamp within bounds.
-        kth = max(1, min(num_to_prune, flat_metric.numel()))
-        threshold = torch.kthvalue(flat_metric, kth, keepdim=False).values
+        flat_metric = metric_tensor.flatten()
+        if metric_tensor.device.type == 'cuda':
+            flat_metric = flat_metric.cuda()
+        threshold_idx = min(num_to_prune, flat_metric.numel() - 1)
+        threshold = torch.sort(flat_metric)[0][threshold_idx]
+        if metric_tensor.device.type == 'cpu':
+            threshold = threshold.cpu()
         mask = metric_tensor <= threshold
         weight_tensor[mask] = 0
         return mask.sum().item(), numel
