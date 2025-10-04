@@ -65,14 +65,52 @@ class RunningStats:
         return self.M2 / (self.count - 1)
 
 
-def collect_neuronrank_statistics(model, dataloader, device):
+def _compute_top_token_ids(dataloader, tokenizer, max_classes=512):
+    if max_classes <= 0:
+        return []
+
+    vocab_size = getattr(tokenizer, "vocab_size", None)
+    if vocab_size is None:
+        return []
+
+    counts = torch.zeros(vocab_size, dtype=torch.long)
+    for batch in dataloader:
+        input_ids = batch[0] if isinstance(batch, (tuple, list)) else batch
+        ids = input_ids.reshape(-1).cpu()
+        counts.index_add_(0, ids, torch.ones_like(ids, dtype=torch.long))
+
+    nonzero = (counts > 0).nonzero(as_tuple=False).squeeze(-1)
+    if nonzero.numel() == 0:
+        return []
+
+    k = min(max_classes, nonzero.numel())
+    topk = torch.topk(counts, k).indices.tolist()
+    return topk
+
+
+def collect_neuronrank_statistics(model, dataloader, tokenizer, device, max_classes=512):
     """Capture post-activation statistics for each LLaMA MLP gate projection."""
 
     if not hasattr(model, "model") or not hasattr(model.model, "layers"):
         raise ValueError("Expected the model to expose model.layers for NeuronRank scoring.")
 
+    batches = list(dataloader)
+    if not batches:
+        raise ValueError("Calibration dataloader for NeuronRank produced no batches.")
+
+    top_token_ids = _compute_top_token_ids(batches, tokenizer, max_classes=max_classes)
+    vocab_size = getattr(tokenizer, "vocab_size", 0)
+    class_index_lookup = torch.full((vocab_size,), -1, dtype=torch.long) if top_token_ids else None
+    if class_index_lookup is not None:
+        for idx, tok in enumerate(top_token_ids):
+            if tok < vocab_size:
+                class_index_lookup[tok] = idx
+
+    num_classes = len(top_token_ids)
+    print(f"loading calibration data ({len(batches)} batches, tracking {num_classes} token classes)")
     layer_stats = {}
     hooks = []
+    current_batch_token_ids = None
 
     for layer_idx, layer in enumerate(model.model.layers):
         gate_proj = getattr(layer.mlp, "gate_proj", None)
@@ -82,6 +120,8 @@ def collect_neuronrank_statistics(model, dataloader, device):
         layer_stats[layer_idx] = {
             "sample": RunningStats(gate_proj.out_features),
             "token": RunningStats(gate_proj.out_features),
+            "class_sum": torch.zeros((num_classes, gate_proj.out_features), dtype=torch.float64) if num_classes else None,
+            "class_count": torch.zeros(num_classes, dtype=torch.float64) if num_classes else None,
         }
 
         def make_hook(idx):
@@ -96,23 +136,48 @@ def collect_neuronrank_statistics(model, dataloader, device):
                     per_sample = act
                     per_token = act
 
-                layer_stats[idx]["sample"].update(per_sample.detach().to(dtype=torch.float32, device="cpu"))
-                layer_stats[idx]["token"].update(per_token.detach().to(dtype=torch.float32, device="cpu"))
+                per_sample_cpu = per_sample.detach().to(dtype=torch.float32, device="cpu")
+                per_token_cpu = per_token.detach().to(dtype=torch.float32, device="cpu")
+
+                layer_stats[idx]["sample"].update(per_sample_cpu)
+                layer_stats[idx]["token"].update(per_token_cpu)
+
+                if class_index_lookup is not None:
+                    flat_ids = current_batch_token_ids
+                    if flat_ids is None:
+                        return
+                    if flat_ids.numel() != per_token_cpu.shape[0]:
+                        return
+                    within_vocab = flat_ids < class_index_lookup.shape[0]
+                    if not within_vocab.any():
+                        return
+                    masked_ids = flat_ids[within_vocab]
+                    class_indices = class_index_lookup[masked_ids]
+                    valid_mask = class_indices != -1
+                    if not valid_mask.any():
+                        return
+                    idxs = class_indices[valid_mask]
+                    token_values = per_token_cpu[within_vocab][valid_mask].to(dtype=torch.float64)
+                    layer_stats[idx]["class_sum"].index_add_(0, idxs, token_values)
+                    layer_stats[idx]["class_count"].index_add_(0, idxs, torch.ones(idxs.size(0), dtype=torch.float64))
 
             return hook
 
         hooks.append(gate_proj.register_forward_hook(make_hook(layer_idx)))
 
     model.eval()
+    print("loading calibration data")
     with torch.no_grad():
-        for batch in dataloader:
+        for batch in batches:
             if isinstance(batch, (tuple, list)):
                 input_ids = batch[0]
             else:
                 input_ids = batch
             input_ids = input_ids.to(device)
             attention_mask = torch.ones_like(input_ids, device=device)
+            current_batch_token_ids = input_ids.reshape(-1).cpu()
             model(input_ids=input_ids, attention_mask=attention_mask)
+            current_batch_token_ids = None
 
     for handle in hooks:
         handle.remove()
@@ -121,14 +186,25 @@ def collect_neuronrank_statistics(model, dataloader, device):
     for idx, stat in layer_stats.items():
         sample_var = stat["sample"].variance().to(dtype=torch.float32)
         token_var = stat["token"].variance().to(dtype=torch.float32)
+        class_var = None
+        if stat.get("class_sum") is not None:
+            counts = stat["class_count"]
+            valid = counts > 0
+            if valid.any():
+                class_means = (stat["class_sum"][valid] / counts[valid].unsqueeze(1)).to(dtype=torch.float32)
+                if class_means.size(0) > 1:
+                    class_var = class_means.var(dim=0, unbiased=False)
+                else:
+                    class_var = torch.zeros_like(sample_var)
         stats[idx] = {
             "sample_variance": sample_var,
             "token_variance": token_var,
+            "class_variance": class_var,
         }
     return stats
 
 
-def compute_neuronrank_scores(model, stats, token_weight=0.0):
+def compute_neuronrank_scores(model, stats, token_weight=0.0, discrimination_weight=2.0):
     scores = {}
     for layer_idx, layer in enumerate(model.model.layers):
         gate_proj = getattr(layer.mlp, "gate_proj", None)
@@ -144,8 +220,12 @@ def compute_neuronrank_scores(model, stats, token_weight=0.0):
             variance = layer_stats["sample_variance"].to(row_norm.device)
             if token_weight > 0:
                 variance = variance + token_weight * layer_stats["token_variance"].to(row_norm.device)
+            class_variance = layer_stats.get("class_variance")
+            if class_variance is not None:
+                variance = variance + class_variance.to(row_norm.device)
 
-        scores[layer_idx] = (variance.clamp(min=0.0) ** 2) * row_norm
+        variance = variance.clamp(min=0.0).pow(discrimination_weight)
+        scores[layer_idx] = variance * row_norm
     return scores
 
 
@@ -185,6 +265,8 @@ def apply_neuronrank_pruning(model, scores, sparsity_ratio):
         if down_proj is not None:
             down_proj.weight.data[:, prune_idx_list] = 0
 
+        layer_pct = 100.0 * num_to_prune / num_channels
+        print(f"[NeuronRank] layer {layer_idx}: pruned {num_to_prune}/{num_channels} channels ({layer_pct:.2f}%)")
         total_pruned += num_to_prune
 
     return total_pruned, total_channels
@@ -199,8 +281,19 @@ def prune_neuronrank(args, model, tokenizer, device):
 
     dataloader, _ = get_loaders("c4", nsamples=args.nsamples, seed=args.seed, seqlen=model.seqlen, tokenizer=tokenizer)
     print("collecting NeuronRank statistics")
-    stats = collect_neuronrank_statistics(model, dataloader, device)
-    scores = compute_neuronrank_scores(model, stats, token_weight=args.neuronrank_token_weight)
+    stats = collect_neuronrank_statistics(
+        model,
+        dataloader,
+        tokenizer,
+        device,
+        max_classes=args.neuronrank_max_classes,
+    )
+    scores = compute_neuronrank_scores(
+        model,
+        stats,
+        token_weight=args.neuronrank_token_weight,
+        discrimination_weight=args.nr_discrimination_weight,
+    )
     pruned, total = apply_neuronrank_pruning(model, scores, args.sparsity_ratio)
     model.config.use_cache = use_cache
 
@@ -225,6 +318,10 @@ def main():
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
     parser.add_argument('--neuronrank_token_weight', type=float, default=0.0,
                         help='Additional weight for token-level variance when computing NeuronRank scores (0 disables token variance contribution).')
+    parser.add_argument('--nr-discrimination-weight', dest='nr_discrimination_weight', type=float, default=2.0,
+                        help='Exponent applied to the combined variance term in NeuronRank scoring.')
+    parser.add_argument('--neuronrank-max-classes', type=int, default=512,
+                        help='Maximum number of high-frequency token classes to track when computing NeuronRank statistics (0 disables class-aware variance).')
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
