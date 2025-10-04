@@ -215,6 +215,20 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
     if prune_n != 0 or prune_m != 0:
         raise ValueError("NeuronRank unstructured pruning does not support N:M sparsity.")
 
+    def _apply_unstructured_mask(weight_tensor, metric_tensor, ratio):
+        numel = metric_tensor.numel()
+        num_to_prune = int(numel * ratio)
+        if num_to_prune <= 0:
+            return 0, numel
+
+        flat_metric = metric_tensor.view(-1)
+        # kthvalue expects 1-indexed k; clamp within bounds.
+        kth = max(1, min(num_to_prune, flat_metric.numel()))
+        threshold = torch.kthvalue(flat_metric, kth, keepdim=False).values
+        mask = metric_tensor <= threshold
+        weight_tensor[mask] = 0
+        return mask.sum().item(), numel
+
     use_cache = model.config.use_cache
     model.config.use_cache = False
 
@@ -240,20 +254,26 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
         discrimination_weight=args.nr_discrimination_weight,
     )
 
+    total_pruned = 0
+    total_weights = 0
+
     layers = model.model.layers
     for i, layer in enumerate(layers):
         subset = find_layers(layer)
         layer_scores = scores.get(i)
 
         for name, module in subset.items():
-            W = module.weight.data
+            if not args.nr_include_attention and "mlp" not in name:
+                continue
+
+            weight = module.weight.data
             if args.sparsity_ratio <= 0:
                 continue
 
-            W_metric = torch.abs(W)
+            metric = torch.abs(weight)
 
             if layer_scores is not None and "mlp" in name:
-                score_vec = layer_scores.to(W_metric.device, dtype=W_metric.dtype).clamp(min=1e-12)
+                score_vec = layer_scores.to(metric.device, dtype=metric.dtype).clamp(min=1e-12)
                 if "gate_proj" in name or "up_proj" in name:
                     scale = score_vec.view(-1, 1)
                 elif "down_proj" in name:
@@ -261,24 +281,28 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
                 else:
                     scale = None
                 if scale is not None:
-                    W_metric = W_metric * scale
+                    metric = metric * scale
 
-            numel = W_metric.numel()
-            num_to_prune = int(numel * args.sparsity_ratio)
-            if num_to_prune <= 0:
-                continue
+            pruned, numel = _apply_unstructured_mask(weight, metric, args.sparsity_ratio)
+            total_pruned += pruned
+            total_weights += numel
 
-            flat_sorted = torch.sort(W_metric.flatten(), stable=True)[0]
-            cutoff_index = min(num_to_prune, flat_sorted.numel() - 1)
-            threshold = flat_sorted[cutoff_index]
-            W_mask = W_metric <= threshold
+            print(f"[NeuronRank-Unstructured] layer {i} name {name} pruned {pruned} / {numel}")
 
-            module.weight.data[W_mask] = 0
-
-            print(f"[NeuronRank-Unstructured] layer {i} name {name} pruned {W_mask.sum().item()} / {numel}")
+    if args.nr_prune_lm_head and hasattr(model, "lm_head") and isinstance(model.lm_head, nn.Linear):
+        weight = model.lm_head.weight.data
+        metric = torch.abs(weight)
+        pruned, numel = _apply_unstructured_mask(weight, metric, args.sparsity_ratio)
+        total_pruned += pruned
+        total_weights += numel
+        print(f"[NeuronRank-Unstructured] lm_head pruned {pruned} / {numel}")
 
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()
+
+    if total_weights:
+        pct = 100.0 * total_pruned / total_weights
+        print(f"[NeuronRank-Unstructured] global pruning ratio {pct:.2f}% ({total_pruned}/{total_weights})")
 
 
 @torch.no_grad()

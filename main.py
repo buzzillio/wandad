@@ -129,6 +129,13 @@ def main():
                         help='Exponent applied to the combined variance term in NeuronRank scoring.')
     parser.add_argument('--neuronrank-max-classes', type=int, default=512,
                         help='Maximum number of high-frequency token classes to track when computing NeuronRank statistics (0 disables class-aware variance).')
+    parser.add_argument('--nr-include-attention', dest='nr_include_attention', action='store_true',
+                        help='When using NeuronRank unstructured pruning, also prune attention projection weights (default).')
+    parser.add_argument('--nr-skip-attention', dest='nr_include_attention', action='store_false',
+                        help='Skip pruning attention projection weights in NeuronRank unstructured mode.')
+    parser.set_defaults(nr_include_attention=True)
+    parser.add_argument('--nr-prune-lm-head', action='store_true',
+                        help='Also prune the LM head using magnitude when running NeuronRank unstructured pruning.')
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
