@@ -204,6 +204,18 @@ def compute_neuronrank_scores(model, stats, token_weight=0.0, discrimination_wei
     return scores
 
 
+def compute_neuronrank_class_scores(stats, min_value: float = 0.0):
+    """Derive per-neuron scores directly from class-wise variance."""
+
+    scores = {}
+    for layer_idx, layer_stats in stats.items():
+        class_variance = layer_stats.get("class_variance")
+        if class_variance is None:
+            continue
+        scores[layer_idx] = class_variance.clamp_min(min_value)
+    return scores
+
+
 def apply_neuronrank_pruning(model, scores, sparsity_ratio):
     total_channels = 0
     total_pruned = 0

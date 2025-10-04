@@ -18,6 +18,7 @@ from lib.eval import eval_ppl, eval_zero_shot
 from lib.neuronrank import (
     collect_neuronrank_statistics,
     compute_neuronrank_scores,
+    compute_neuronrank_class_scores,
     apply_neuronrank_pruning,
 )
 
@@ -74,6 +75,41 @@ def prune_neuronrank(args, model, tokenizer, device):
     print(f"NeuronRank pruned {pruned}/{total} channels across MLPs ({pct:.2f}% structural sparsity)")
 
 
+def prune_neuronrank_variance(args, model, tokenizer, device):
+    if args.sparsity_type != "unstructured":
+        raise ValueError("NeuronRank variance-only pruning currently only supports unstructured sparsity type.")
+    if args.neuronrank_max_classes <= 0:
+        raise ValueError("NeuronRank variance-only pruning requires --neuronrank-max-classes > 0 to collect token-class statistics.")
+
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    dataloader, _ = get_loaders(
+        "c4",
+        nsamples=args.nsamples,
+        seed=args.seed,
+        seqlen=model.seqlen,
+        tokenizer=tokenizer,
+    )
+    print("collecting NeuronRank class variance statistics")
+    stats = collect_neuronrank_statistics(
+        model,
+        dataloader,
+        tokenizer,
+        device,
+        max_classes=args.neuronrank_max_classes,
+    )
+    scores = compute_neuronrank_class_scores(stats)
+    if not scores:
+        raise RuntimeError("NeuronRank variance-only pruning could not compute class variance scores (no classes collected).")
+
+    pruned, total = apply_neuronrank_pruning(model, scores, args.sparsity_ratio)
+    model.config.use_cache = use_cache
+
+    pct = 100.0 * pruned / total if total else 0.0
+    print(f"NeuronRank variance-only pruned {pruned}/{total} channels across MLPs ({pct:.2f}% structural sparsity)")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, help='LLaMA model')
@@ -82,7 +118,7 @@ def main():
     parser.add_argument('--sparsity_ratio', type=float, default=0, help='Sparsity level')
     parser.add_argument("--sparsity_type", type=str, choices=["unstructured", "4:8", "2:4"])
     parser.add_argument("--prune_method", type=str, choices=["magnitude", "wanda", "sparsegpt", 
-                        "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search", "neuronrank", "neuronrank_unstructured"])
+                        "ablate_mag_seq", "ablate_wanda_seq", "ablate_mag_iter", "ablate_wanda_iter", "search", "neuronrank", "neuronrank_unstructured", "neuronrank_variance"])
     parser.add_argument("--cache_dir", default="llm_weights", type=str )
     parser.add_argument('--use_variant', action="store_true", help="whether to use the wanda variant described in the appendix")
     parser.add_argument('--save', type=str, default=None, help='Path to save results.')
@@ -132,6 +168,8 @@ def main():
             prune_neuronrank(args, model, tokenizer, device)
         elif args.prune_method == "neuronrank_unstructured":
             prune_neuronrank_unstructured(args, model, tokenizer, device, prune_n=prune_n, prune_m=prune_m)
+        elif args.prune_method == "neuronrank_variance":
+            prune_neuronrank_variance(args, model, tokenizer, device)
 
     ################################################################
     print("*"*30)
