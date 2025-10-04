@@ -87,15 +87,15 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def build_command(save_path: Path, discrimination_multi: float, discrimination_exp: float, magnitude_multi: float) -> list[str]:
+def build_command(save_path: Path, variance_exp: float, variance_multi: float, magnitude_multi: float) -> list[str]:
     command = list(BASE_COMMAND)
     command.extend(
         [
-            "--magnitude-base",
-            f"{discrimination_multi}",
-            "--magnitude-exp",
-            f"{discrimination_exp}",
+            "--variance-exp",
+            f"{variance_exp}",
             "--variance-multi",
+            f"{variance_multi}",
+            "--magnitude-multi",
             f"{magnitude_multi}",
             "--save",
             str(save_path),
@@ -154,8 +154,8 @@ def main() -> None:
     env.setdefault("PYTHONUNBUFFERED", "1")
 
     def objective(trial: optuna.trial.Trial) -> float:
-        discrimination_multi = trial.suggest_float("discrimination_multi", 0.0, 3.0, step=0.5)
-        discrimination_exp = trial.suggest_float("discrimination_exp", 0.5, 3.0, step=0.5)
+        variance_exp = trial.suggest_float("variance_exp", 0.5, 3.0, step=0.5)
+        variance_multi = trial.suggest_float("variance_multi", 0.0, 3.0, step=0.5)
         magnitude_multi = trial.suggest_float("magnitude_multi", 0.0, 3.0, step=0.5)
 
         trial_save_dir = save_dir / f"trial_{trial.number:04d}"
@@ -163,14 +163,14 @@ def main() -> None:
 
         command = build_command(
             trial_save_dir,
-            discrimination_multi=discrimination_multi,
-            discrimination_exp=discrimination_exp,
+            variance_exp=variance_exp,
+            variance_multi=variance_multi,
             magnitude_multi=magnitude_multi,
         )
 
         print(
-            f"[Trial {trial.number}] Running: discrimination_multi={discrimination_multi}, "
-            f"discrimination_exp={discrimination_exp}, magnitude_multi={magnitude_multi}"
+            f"[Trial {trial.number}] Running: variance_exp={variance_exp}, "
+            f"variance_multi={variance_multi}, magnitude_multi={magnitude_multi}"
         )
         ppl = run_trial(command, env=env)
         print(f"[Trial {trial.number}] Wikitext perplexity: {ppl:.4f}")

@@ -203,12 +203,11 @@ def compute_neuronrank_scores(
     model,
     stats,
     token_weight=0.0,
-    magnitude_base=1.0,
-    magnitude_exp=1.0,
-    variance_multi=0.0,
+    variance_exp=1.0,
+    variance_multi=1.0,
+    magnitude_multi=0.0,
 ) -> Dict[int, Dict[str, Optional[torch.Tensor]]]:
     scores: Dict[int, Dict[str, Optional[torch.Tensor]]] = {}
-    mag_factor = _safe_scalar_pow(magnitude_base, magnitude_exp)
     for layer_idx, layer in enumerate(model.model.layers):
         gate_proj = getattr(layer.mlp, "gate_proj", None)
         if gate_proj is None:
@@ -228,9 +227,17 @@ def compute_neuronrank_scores(
                 variance = variance + class_variance.to(row_norm.device)
 
         variance = variance.clamp(min=0.0)
-        channel_score = row_norm * mag_factor
-        if variance_multi != 0.0:
-            channel_score = channel_score + variance * variance_multi
+        
+        if variance_exp == 0.0:
+            variance_term = torch.ones_like(variance)
+        elif variance_exp == 1.0:
+            variance_term = variance
+        else:
+            variance_term = torch.pow(variance.clamp(min=1e-12), variance_exp)
+        
+        variance_component = variance_term * variance_multi
+        magnitude_component = row_norm * magnitude_multi
+        channel_score = variance_component + magnitude_component
 
         scores[layer_idx] = {
             "channel": channel_score,

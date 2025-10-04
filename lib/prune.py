@@ -254,22 +254,15 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
         model,
         stats,
         token_weight=args.neuronrank_token_weight,
-        magnitude_base=args.magnitude_base,
-        magnitude_exp=args.magnitude_exp,
+        variance_exp=args.variance_exp,
         variance_multi=args.variance_multi,
+        magnitude_multi=args.magnitude_multi,
     )
 
     total_pruned = 0
     total_weights = 0
 
-    if args.magnitude_exp == 0.0:
-        mag_factor = 1.0
-    elif args.magnitude_base <= 0.0:
-        mag_factor = 0.0
-    else:
-        mag_factor = float(args.magnitude_base ** args.magnitude_exp)
-
-    variance_scale = float(args.variance_multi)
+    magnitude_scale = float(args.magnitude_multi)
 
     layers = model.model.layers
     for i, layer in enumerate(layers):
@@ -287,22 +280,31 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
             if args.sparsity_ratio <= 0:
                 continue
 
-            metric = torch.abs(weight) * mag_factor
+            metric = torch.abs(weight) * magnitude_scale
 
             if (
-                variance_scale != 0.0
-                and layer_variance is not None
+                layer_variance is not None
                 and "mlp" in name
             ):
                 variance_vec = layer_variance.to(metric.device, dtype=metric.dtype)
+                
+                if args.variance_exp == 0.0:
+                    variance_term = torch.ones_like(variance_vec)
+                elif args.variance_exp == 1.0:
+                    variance_term = variance_vec
+                else:
+                    variance_term = torch.pow(variance_vec.clamp(min=1e-12), args.variance_exp)
+                
+                variance_component = variance_term * args.variance_multi
+                
                 if "gate_proj" in name or "up_proj" in name:
-                    addition = variance_vec.view(-1, 1)
+                    addition = variance_component.view(-1, 1)
                 elif "down_proj" in name:
-                    addition = variance_vec.view(1, -1)
+                    addition = variance_component.view(1, -1)
                 else:
                     addition = None
                 if addition is not None:
-                    metric = metric + addition * variance_scale
+                    metric = metric + addition
 
             pruned, numel = _apply_unstructured_mask(weight, metric, args.sparsity_ratio)
             total_pruned += pruned
