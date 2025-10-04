@@ -73,35 +73,12 @@ def _load_wikitext_split(filename):
     return lines
 
 
-# Load and process wikitext2 dataset
+# Load wikitext2 dataset via datasets library only
 def get_wikitext2(nsamples, seed, seqlen, tokenizer):
-    try:
-        traindata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='train')
-        testdata = load_dataset('wikitext', 'wikitext-2-raw-v1', split='test')
-        train_text = traindata['text']
-        test_text = testdata['text']
-    except Exception as err:
-        if "Invalid pattern" not in str(err):
-            raise
-        print("[info] Falling back to manual wikitext-2 download via huggingface_hub")
-        train_text = _load_wikitext_split("wiki.train.raw")
-        test_text = _load_wikitext_split("wiki.test.raw")
-
-    # Encode datasets
-    trainenc = tokenizer(" ".join(train_text), return_tensors='pt')
-    testenc = tokenizer("\n\n".join(test_text), return_tensors='pt')
-
-    # Generate samples from training set
-    random.seed(seed)
-    trainloader = []
-    for _ in range(nsamples):
-        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
-        j = i + seqlen
-        inp = trainenc.input_ids[:, i:j]
-        tar = inp.clone()
-        tar[:, :-1] = -100
-        trainloader.append((inp, tar))
-    return trainloader, testenc
+    ds = load_dataset("wikitext", "wikitext-2-raw-v1")
+    train = ds["train"]
+    test = ds["test"]
+    return train, test
 
 # Load and process c4 dataset
 # def get_c4(nsamples, seed, seqlen, tokenizer):
