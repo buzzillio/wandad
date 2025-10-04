@@ -5,15 +5,17 @@ import torch.nn.functional as F
 class RunningStats:
     """Track mean and variance for high-dimensional tensors using Welford grouping."""
 
-    def __init__(self, size: int):
+    def __init__(self, size: int, dtype: torch.dtype = torch.float32, device: torch.device | str = "cpu"):
         self.count = 0
-        self.mean = torch.zeros(size, dtype=torch.float64)
-        self.M2 = torch.zeros(size, dtype=torch.float64)
+        self.dtype = dtype
+        self.device = device
+        self.mean = torch.zeros(size, dtype=dtype, device=device)
+        self.M2 = torch.zeros(size, dtype=dtype, device=device)
 
     def update(self, batch: torch.Tensor):
         if batch is None or batch.numel() == 0:
             return
-        batch = batch.to(torch.float64)
+        batch = batch.to(self.dtype)
         batch_count = batch.shape[0]
         if batch_count == 0:
             return
@@ -89,17 +91,21 @@ def collect_neuronrank_statistics(model, dataloader, tokenizer, device, max_clas
     layer_stats = {}
     hooks = []
     current_batch_token_ids = None
+    class_lookup_cache = {}
 
     for layer_idx, layer in enumerate(model.model.layers):
         gate_proj = getattr(layer.mlp, "gate_proj", None)
         if gate_proj is None:
             continue
 
+        layer_device = gate_proj.weight.device
+        layer_dtype = torch.float32
+
         layer_stats[layer_idx] = {
-            "sample": RunningStats(gate_proj.out_features),
-            "token": RunningStats(gate_proj.out_features),
-            "class_sum": torch.zeros((num_classes, gate_proj.out_features), dtype=torch.float64) if num_classes else None,
-            "class_count": torch.zeros(num_classes, dtype=torch.float64) if num_classes else None,
+            "sample": RunningStats(gate_proj.out_features, dtype=layer_dtype, device=layer_device),
+            "token": RunningStats(gate_proj.out_features, dtype=layer_dtype, device=layer_device),
+            "class_sum": torch.zeros((num_classes, gate_proj.out_features), dtype=layer_dtype, device=layer_device) if num_classes else None,
+            "class_count": torch.zeros(num_classes, dtype=layer_dtype, device=layer_device) if num_classes else None,
         }
 
         def make_hook(idx):
@@ -114,28 +120,32 @@ def collect_neuronrank_statistics(model, dataloader, tokenizer, device, max_clas
                     per_sample = act
                     per_token = act
 
-                per_sample_cpu = per_sample.detach().to(dtype=torch.float32, device="cpu")
-                per_token_cpu = per_token.detach().to(dtype=torch.float32, device="cpu")
+                per_sample_local = per_sample.detach().to(dtype=layer_dtype)
+                per_token_local = per_token.detach().to(dtype=layer_dtype)
 
-                layer_stats[idx]["sample"].update(per_sample_cpu)
-                layer_stats[idx]["token"].update(per_token_cpu)
+                layer_stats[idx]["sample"].update(per_sample_local)
+                layer_stats[idx]["token"].update(per_token_local)
 
                 if class_index_lookup is not None:
                     flat_ids = current_batch_token_ids
-                    if flat_ids is None or flat_ids.numel() != per_token_cpu.shape[0]:
+                    if flat_ids is None or flat_ids.numel() != per_token_local.shape[0]:
                         return
-                    within_vocab = flat_ids < class_index_lookup.shape[0]
+                    lookup = class_lookup_cache.get(per_sample_local.device)
+                    if lookup is None:
+                        lookup = class_index_lookup.to(per_sample_local.device)
+                        class_lookup_cache[per_sample_local.device] = lookup
+                    within_vocab = flat_ids < lookup.shape[0]
                     if not within_vocab.any():
                         return
                     masked_ids = flat_ids[within_vocab]
-                    class_indices = class_index_lookup[masked_ids]
+                    class_indices = lookup[masked_ids]
                     valid_mask = class_indices != -1
                     if not valid_mask.any():
                         return
                     idxs = class_indices[valid_mask]
-                    token_values = per_token_cpu[within_vocab][valid_mask].to(dtype=torch.float64)
+                    token_values = per_token_local[within_vocab][valid_mask]
                     layer_stats[idx]["class_sum"].index_add_(0, idxs, token_values)
-                    layer_stats[idx]["class_count"].index_add_(0, idxs, torch.ones(idxs.size(0), dtype=torch.float64))
+                    layer_stats[idx]["class_count"].index_add_(0, idxs, torch.ones(idxs.size(0), dtype=layer_dtype, device=token_values.device))
 
             return hook
 
@@ -150,7 +160,7 @@ def collect_neuronrank_statistics(model, dataloader, tokenizer, device, max_clas
                 input_ids = batch
             input_ids = input_ids.to(device)
             attention_mask = torch.ones_like(input_ids, device=device)
-            current_batch_token_ids = input_ids.reshape(-1).cpu()
+            current_batch_token_ids = input_ids.reshape(-1)
             model(input_ids=input_ids, attention_mask=attention_mask)
             current_batch_token_ids = None
 
@@ -159,14 +169,14 @@ def collect_neuronrank_statistics(model, dataloader, tokenizer, device, max_clas
 
     stats = {}
     for idx, stat in layer_stats.items():
-        sample_var = stat["sample"].variance().to(dtype=torch.float32)
-        token_var = stat["token"].variance().to(dtype=torch.float32)
+        sample_var = stat["sample"].variance().to(dtype=torch.float32, device="cpu")
+        token_var = stat["token"].variance().to(dtype=torch.float32, device="cpu")
         class_var = None
         if stat.get("class_sum") is not None:
             counts = stat["class_count"]
             valid = counts > 0
             if valid.any():
-                class_means = (stat["class_sum"][valid] / counts[valid].unsqueeze(1)).to(dtype=torch.float32)
+                class_means = (stat["class_sum"][valid] / counts[valid].unsqueeze(1)).to(dtype=torch.float32, device="cpu")
                 if class_means.size(0) > 1:
                     class_var = class_means.var(dim=0, unbiased=False)
                 else:
@@ -179,7 +189,14 @@ def collect_neuronrank_statistics(model, dataloader, tokenizer, device, max_clas
     return stats
 
 
-def compute_neuronrank_scores(model, stats, token_weight=0.0, discrimination_weight=2.0):
+def compute_neuronrank_scores(
+    model,
+    stats,
+    token_weight=0.0,
+    discrimination_multi=1.0,
+    discrimination_exp=2.0,
+    magnitude_multi=1.0,
+):
     scores = {}
     for layer_idx, layer in enumerate(model.model.layers):
         gate_proj = getattr(layer.mlp, "gate_proj", None)
@@ -199,8 +216,18 @@ def compute_neuronrank_scores(model, stats, token_weight=0.0, discrimination_wei
             if class_variance is not None:
                 variance = variance + class_variance.to(row_norm.device)
 
-        variance = variance.clamp(min=0.0).pow(discrimination_weight)
-        scores[layer_idx] = variance * row_norm
+        variance = variance.clamp(min=0.0)
+        variance_base = (variance * discrimination_multi).clamp(min=0.0)
+        if discrimination_exp == 0.0:
+            variance_term = torch.ones_like(variance_base)
+        elif discrimination_exp == 1.0:
+            variance_term = variance_base
+        else:
+            pow_base = variance_base.clamp(min=1e-12) if discrimination_exp < 0 else variance_base
+            variance_term = torch.pow(pow_base, discrimination_exp)
+
+        magnitude_term = row_norm * magnitude_multi
+        scores[layer_idx] = variance_term + magnitude_term
     return scores
 
 

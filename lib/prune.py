@@ -251,7 +251,9 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
         model,
         stats,
         token_weight=args.neuronrank_token_weight,
-        discrimination_weight=args.nr_discrimination_weight,
+        discrimination_multi=args.discrimination_multi,
+        discrimination_exp=args.discrimination_exp,
+        magnitude_multi=args.magnitude_multi,
     )
 
     total_pruned = 0

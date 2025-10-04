@@ -66,7 +66,9 @@ def prune_neuronrank(args, model, tokenizer, device):
         model,
         stats,
         token_weight=args.neuronrank_token_weight,
-        discrimination_weight=args.nr_discrimination_weight,
+        discrimination_multi=args.discrimination_multi,
+        discrimination_exp=args.discrimination_exp,
+        magnitude_multi=args.magnitude_multi,
     )
     pruned, total = apply_neuronrank_pruning(model, scores, args.sparsity_ratio)
     model.config.use_cache = use_cache
@@ -125,8 +127,14 @@ def main():
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
     parser.add_argument('--neuronrank_token_weight', type=float, default=0.0,
                         help='Additional weight for token-level variance when computing NeuronRank scores (0 disables token variance contribution).')
-    parser.add_argument('--nr-discrimination-weight', dest='nr_discrimination_weight', type=float, default=2.0,
-                        help='Exponent applied to the combined variance term in NeuronRank scoring.')
+    parser.add_argument('--discrimination-multi', dest='discrimination_multi', type=float, default=1.0,
+                        help='Multiplier applied to the variance-based discrimination term before exponentiation.')
+    parser.add_argument('--discrimination-exp', dest='discrimination_exp', type=float, default=2.0,
+                        help='Exponent applied to the scaled variance-based discrimination term.')
+    parser.add_argument('--magnitude-multi', dest='magnitude_multi', type=float, default=1.0,
+                        help='Multiplier applied to the weight-magnitude term in NeuronRank scoring.')
+    parser.add_argument('--nr-discrimination-weight', dest='nr_discrimination_weight', type=float, default=None,
+                        help='[Deprecated] Alias for --discrimination-exp; will be removed in a future release.')
     parser.add_argument('--neuronrank-max-classes', type=int, default=512,
                         help='Maximum number of high-frequency token classes to track when computing NeuronRank statistics (0 disables class-aware variance).')
     parser.add_argument('--nr-include-attention', dest='nr_include_attention', action='store_true',
@@ -139,6 +147,11 @@ def main():
 
     parser.add_argument("--eval_zero_shot", action="store_true")
     args = parser.parse_args()
+
+    if getattr(args, "nr_discrimination_weight", None) is not None:
+        if args.discrimination_exp == parser.get_default("discrimination_exp"):
+            args.discrimination_exp = args.nr_discrimination_weight
+        print("[Warning] --nr-discrimination-weight is deprecated; please use --discrimination-exp instead.")
 
     # Setting seeds for reproducibility
     np.random.seed(args.seed)
