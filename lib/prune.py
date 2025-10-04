@@ -251,18 +251,30 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
         model,
         stats,
         token_weight=args.neuronrank_token_weight,
-        discrimination_multi=args.discrimination_multi,
-        discrimination_exp=args.discrimination_exp,
-        magnitude_multi=args.magnitude_multi,
+        magnitude_base=args.magnitude_base,
+        magnitude_exp=args.magnitude_exp,
+        variance_multi=args.variance_multi,
     )
 
     total_pruned = 0
     total_weights = 0
 
+    if args.magnitude_exp == 0.0:
+        mag_factor = 1.0
+    elif args.magnitude_base <= 0.0:
+        mag_factor = 0.0
+    else:
+        mag_factor = float(args.magnitude_base ** args.magnitude_exp)
+
+    variance_scale = float(args.variance_multi)
+
     layers = model.model.layers
     for i, layer in enumerate(layers):
         subset = find_layers(layer)
-        layer_scores = scores.get(i)
+        layer_entry = scores.get(i)
+        layer_variance = None
+        if isinstance(layer_entry, dict):
+            layer_variance = layer_entry.get("variance")
 
         for name, module in subset.items():
             if not args.nr_include_attention and "mlp" not in name:
@@ -272,18 +284,22 @@ def prune_neuronrank_unstructured(args, model, tokenizer, device=torch.device("c
             if args.sparsity_ratio <= 0:
                 continue
 
-            metric = torch.abs(weight)
+            metric = torch.abs(weight) * mag_factor
 
-            if layer_scores is not None and "mlp" in name:
-                score_vec = layer_scores.to(metric.device, dtype=metric.dtype).clamp(min=1e-12)
+            if (
+                variance_scale != 0.0
+                and layer_variance is not None
+                and "mlp" in name
+            ):
+                variance_vec = layer_variance.to(metric.device, dtype=metric.dtype)
                 if "gate_proj" in name or "up_proj" in name:
-                    scale = score_vec.view(-1, 1)
+                    addition = variance_vec.view(-1, 1)
                 elif "down_proj" in name:
-                    scale = score_vec.view(1, -1)
+                    addition = variance_vec.view(1, -1)
                 else:
-                    scale = None
-                if scale is not None:
-                    metric = metric * scale
+                    addition = None
+                if addition is not None:
+                    metric = metric + addition * variance_scale
 
             pruned, numel = _apply_unstructured_mask(weight, metric, args.sparsity_ratio)
             total_pruned += pruned

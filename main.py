@@ -72,9 +72,9 @@ def prune_neuronrank(args, model, tokenizer, device):
         model,
         stats,
         token_weight=args.neuronrank_token_weight,
-        discrimination_multi=args.discrimination_multi,
-        discrimination_exp=args.discrimination_exp,
-        magnitude_multi=args.magnitude_multi,
+        magnitude_base=args.magnitude_base,
+        magnitude_exp=args.magnitude_exp,
+        variance_multi=args.variance_multi,
     )
     pruned, total = apply_neuronrank_pruning(model, scores, args.sparsity_ratio)
     model.config.use_cache = use_cache
@@ -133,14 +133,20 @@ def main():
     parser.add_argument('--save_model', type=str, default=None, help='Path to save the pruned model.')
     parser.add_argument('--neuronrank_token_weight', type=float, default=0.0,
                         help='Additional weight for token-level variance when computing NeuronRank scores (0 disables token variance contribution).')
-    parser.add_argument('--discrimination-multi', dest='discrimination_multi', type=float, default=1.0,
-                        help='Multiplier applied to the variance-based discrimination term before exponentiation.')
-    parser.add_argument('--discrimination-exp', dest='discrimination_exp', type=float, default=2.0,
-                        help='Exponent applied to the scaled variance-based discrimination term.')
-    parser.add_argument('--magnitude-multi', dest='magnitude_multi', type=float, default=1.0,
-                        help='Multiplier applied to the weight-magnitude term in NeuronRank scoring.')
+    parser.add_argument('--magnitude-base', dest='magnitude_base', type=float, default=1.0,
+                        help='Base multiplier applied to the magnitude term (alpha).')
+    parser.add_argument('--magnitude-exp', dest='magnitude_exp', type=float, default=1.0,
+                        help='Exponent applied to the magnitude multiplier (beta).')
+    parser.add_argument('--variance-multi', dest='variance_multi', type=float, default=0.0,
+                        help='Multiplier applied to the variance term (gamma). Set to 0 for pure magnitude pruning.')
+    parser.add_argument('--discrimination-multi', dest='legacy_discrimination_multi', type=float, default=None,
+                        help='[Deprecated] Alias for --magnitude-base; will be removed in a future release.')
+    parser.add_argument('--discrimination-exp', dest='legacy_discrimination_exp', type=float, default=None,
+                        help='[Deprecated] Alias for --magnitude-exp; will be removed in a future release.')
+    parser.add_argument('--magnitude-multi', dest='legacy_magnitude_multi', type=float, default=None,
+                        help='[Deprecated] Alias for --variance-multi; will be removed in a future release.')
     parser.add_argument('--nr-discrimination-weight', dest='nr_discrimination_weight', type=float, default=None,
-                        help='[Deprecated] Alias for --discrimination-exp; will be removed in a future release.')
+                        help='[Deprecated] Alias for --magnitude-exp; will be removed in a future release.')
     parser.add_argument('--neuronrank-max-classes', type=int, default=512,
                         help='Maximum number of high-frequency token classes to track when computing NeuronRank statistics (0 disables class-aware variance).')
     parser.add_argument('--nr-include-attention', dest='nr_include_attention', action='store_true',
@@ -155,9 +161,24 @@ def main():
     args = parser.parse_args()
 
     if getattr(args, "nr_discrimination_weight", None) is not None:
-        if args.discrimination_exp == parser.get_default("discrimination_exp"):
-            args.discrimination_exp = args.nr_discrimination_weight
-        print("[Warning] --nr-discrimination-weight is deprecated; please use --discrimination-exp instead.")
+        if args.magnitude_exp == parser.get_default("magnitude_exp"):
+            args.magnitude_exp = args.nr_discrimination_weight
+        print("[Warning] --nr-discrimination-weight is deprecated; please use --magnitude-exp instead.")
+
+    if getattr(args, "legacy_discrimination_multi", None) is not None:
+        if args.magnitude_base == parser.get_default("magnitude_base"):
+            args.magnitude_base = args.legacy_discrimination_multi
+        print("[Warning] --discrimination-multi is deprecated; please use --magnitude-base instead.")
+
+    if getattr(args, "legacy_discrimination_exp", None) is not None:
+        if args.magnitude_exp == parser.get_default("magnitude_exp"):
+            args.magnitude_exp = args.legacy_discrimination_exp
+        print("[Warning] --discrimination-exp is deprecated; please use --magnitude-exp instead.")
+
+    if getattr(args, "legacy_magnitude_multi", None) is not None:
+        if args.variance_multi == parser.get_default("variance_multi"):
+            args.variance_multi = args.legacy_magnitude_multi
+        print("[Warning] --magnitude-multi is deprecated; please use --variance-multi instead.")
 
     # Setting seeds for reproducibility
     np.random.seed(args.seed)

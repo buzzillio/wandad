@@ -91,11 +91,11 @@ def build_command(save_path: Path, discrimination_multi: float, discrimination_e
     command = list(BASE_COMMAND)
     command.extend(
         [
-            "--discrimination-multi",
+            "--magnitude-base",
             f"{discrimination_multi}",
-            "--discrimination-exp",
+            "--magnitude-exp",
             f"{discrimination_exp}",
-            "--magnitude-multi",
+            "--variance-multi",
             f"{magnitude_multi}",
             "--save",
             str(save_path),

@@ -1,4 +1,4 @@
-from typing import Union
+from typing import Dict, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -191,15 +191,24 @@ def collect_neuronrank_statistics(model, dataloader, tokenizer, device, max_clas
     return stats
 
 
+def _safe_scalar_pow(base: float, exponent: float) -> float:
+    if exponent == 0.0:
+        return 1.0
+    if base <= 0.0:
+        return 0.0
+    return float(base) ** float(exponent)
+
+
 def compute_neuronrank_scores(
     model,
     stats,
     token_weight=0.0,
-    discrimination_multi=1.0,
-    discrimination_exp=2.0,
-    magnitude_multi=1.0,
-):
-    scores = {}
+    magnitude_base=1.0,
+    magnitude_exp=1.0,
+    variance_multi=0.0,
+) -> Dict[int, Dict[str, Optional[torch.Tensor]]]:
+    scores: Dict[int, Dict[str, Optional[torch.Tensor]]] = {}
+    mag_factor = _safe_scalar_pow(magnitude_base, magnitude_exp)
     for layer_idx, layer in enumerate(model.model.layers):
         gate_proj = getattr(layer.mlp, "gate_proj", None)
         if gate_proj is None:
@@ -219,17 +228,14 @@ def compute_neuronrank_scores(
                 variance = variance + class_variance.to(row_norm.device)
 
         variance = variance.clamp(min=0.0)
-        variance_base = (variance * discrimination_multi).clamp(min=0.0)
-        if discrimination_exp == 0.0:
-            variance_term = torch.ones_like(variance_base)
-        elif discrimination_exp == 1.0:
-            variance_term = variance_base
-        else:
-            pow_base = variance_base.clamp(min=1e-12) if discrimination_exp < 0 else variance_base
-            variance_term = torch.pow(pow_base, discrimination_exp)
+        channel_score = row_norm * mag_factor
+        if variance_multi != 0.0:
+            channel_score = channel_score + variance * variance_multi
 
-        magnitude_term = row_norm * magnitude_multi
-        scores[layer_idx] = variance_term + magnitude_term
+        scores[layer_idx] = {
+            "channel": channel_score,
+            "variance": variance if variance is not None else None,
+        }
     return scores
 
 
@@ -250,10 +256,13 @@ def apply_neuronrank_pruning(model, scores, sparsity_ratio):
     total_pruned = 0
 
     for layer_idx, layer in enumerate(model.model.layers):
-        layer_score = scores.get(layer_idx)
-        if layer_score is None:
+        layer_entry = scores.get(layer_idx)
+        if not layer_entry:
             continue
 
+        layer_score = layer_entry.get("channel") if isinstance(layer_entry, dict) else layer_entry
+        if layer_score is None:
+            continue
         gate_proj = getattr(layer.mlp, "gate_proj", None)
         up_proj = getattr(layer.mlp, "up_proj", None)
         down_proj = getattr(layer.mlp, "down_proj", None)
