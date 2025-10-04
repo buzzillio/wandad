@@ -36,8 +36,6 @@ BASE_COMMAND = [
     "--nr-prune-lm-head",
     "--nsamples",
     "128",
-    "--nr-discrimination-weight",
-    "0.5",
 ]
 
 PPL_REGEX = re.compile(r"wikitext perplexity\s+([0-9]+\.?[0-9]*)", re.IGNORECASE)
