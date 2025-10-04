@@ -1,3 +1,5 @@
+from typing import Union
+
 import torch
 import torch.nn.functional as F
 
@@ -5,7 +7,7 @@ import torch.nn.functional as F
 class RunningStats:
     """Track mean and variance for high-dimensional tensors using Welford grouping."""
 
-    def __init__(self, size: int, dtype: torch.dtype = torch.float32, device: torch.device | str = "cpu"):
+    def __init__(self, size: int, dtype: torch.dtype = torch.float32, device: Union[torch.device, str] = "cpu"):
         self.count = 0
         self.dtype = dtype
         self.device = device
