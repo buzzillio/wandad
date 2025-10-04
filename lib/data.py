@@ -73,12 +73,26 @@ def _load_wikitext_split(filename):
     return lines
 
 
-# Load wikitext2 dataset via datasets library only
+# Load wikitext2 dataset via datasets library only (while returning tokenized calibration tuples)
 def get_wikitext2(nsamples, seed, seqlen, tokenizer):
     ds = load_dataset("wikitext", "wikitext-2-raw-v1")
-    train = ds["train"]
-    test = ds["test"]
-    return train, test
+    train_text = ds["train"]["text"]
+    test_text = ds["test"]["text"]
+
+    trainenc = tokenizer(" ".join(train_text), return_tensors='pt')
+    testenc = tokenizer("\n\n".join(test_text), return_tensors='pt')
+
+    random.seed(seed)
+    trainloader = []
+    for _ in range(nsamples):
+        i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
+        j = i + seqlen
+        inp = trainenc.input_ids[:, i:j]
+        tar = inp.clone()
+        tar[:, :-1] = -100
+        trainloader.append((inp, tar))
+
+    return trainloader, testenc
 
 # Load and process c4 dataset
 # def get_c4(nsamples, seed, seqlen, tokenizer):
