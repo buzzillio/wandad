@@ -1,9 +1,15 @@
 import argparse
 import os 
+import warnings
 import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
+
+warnings.filterwarnings(
+    "ignore",
+    message="You are using `torch.load` with `weights_only=False`",
+)
 
 from lib.data import get_loaders
 from lib.prune import (
